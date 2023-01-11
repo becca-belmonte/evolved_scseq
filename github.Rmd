@@ -1,0 +1,470 @@
+---
+title: "evolved_scseq"
+author: "Becca Belmonte"
+date: "2023-01-11"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Libraries 
+```{r, include=FALSE, echo=FALSE, message=FALSE}
+library(Seurat)
+library(tidyverse)
+library(dplyr)
+library(cowplot)
+library(circlize)
+library(chorddiag)
+library(viridis)
+library(rowr)
+library(biomaRt)
+library(DESeq2)
+library(ggrepel)
+library(heatmap3)
+library(lemon)
+library(topGO)
+library(kableExtra)
+library(clusterProfiler)
+library(gridExtra)
+library(ggsignif)
+library(multcomp)
+select <- dplyr::select
+set.seed(1234567)
+
+colors_sex <- c("#D3C164", "#05366E")
+```
+
+# Data import
+```{r}
+Gene_ID_Flybase <- read.table("data/fbgn_annotation_ID_fb_2020_01.tsv", header = F, sep = "\t")
+colnames(Gene_ID_Flybase) <- c("Gene_name", "Species", "FBgn_ID", "Former_FBgn_ID", "CG_ID", "Former_CG_ID")
+Gene_ID_Flybase <- Gene_ID_Flybase %>% 
+  filter(Species == "Dmel")
+
+GO_Flybase <- read_delim("data/gene_association.fb", "\t", escape_double = FALSE, col_names = FALSE, comment = "!", trim_ws = TRUE)
+colnames(GO_Flybase) = c("DB","DB_Object_ID","DB_Object_Symbol","Qualifier","GO_ID","DB_reference","Evidence","with","Aspect","DB_Object_name","DB_Object_synonyme","DB_Object_type","Taxon","Date","Assigned by")
+
+GO_database <- cbind.fill(GO_Flybase, Gene_ID_Flybase$Gene_name[GO_Flybase$DB_Object_ID %in% Gene_ID_Flybase$FBgn_ID], fill = NA)
+
+annotations <- read.table("data/fbgn_annotation_ID_fb_2020_01.tsv", header = F, sep = "\t")
+colnames(annotations) <- c("gene_symbol", "organism_abbreviation", "primary_FBgn", "secondary_FBgn(s)", "annotation_ID", "secondary_annotation_ID(s)")
+
+mart <- useDataset(dataset = "dmelanogaster_gene_ensembl",
+                   mart = useMart("ENSEMBL_MART_ENSEMBL"))
+resultTable <- getBM(attributes = c("flybase_gene_id", "go_id", "name_1006", "definition_1006"),
+                     mart = mart)
+resultTable <- resultTable[resultTable$go_id != '',]
+geneID2GO <- by(resultTable$go_id,
+                resultTable$flybase_gene_id,
+                function(x) as.character(x))
+
+load("data/GSE148826_intergrated_hemocytes.Robj")
+ramesh = UpdateSeuratObject(object = integrated_hemocytes)
+
+#DimPlot(ramesh, reduction = "umap")
+```
+
+
+## Assign sex
+```{r}
+
+cells <- colnames(ramesh@assays[["RNA"]])
+ramesh_counts <- as.data.frame(as.matrix(ramesh@assays[["RNA"]]@counts))
+
+total <- colSums(ramesh_counts, na.rm = FALSE, dims = 1)
+total <- total/1000000
+
+ramesh_df_count <- ramesh_counts %>% 
+       mutate(gene = rownames(.)) %>% 
+       filter(gene == "FBgn0019661" | gene == "FBgn0019660")
+     rownames(ramesh_df_count) <- ramesh_df_count$gene 
+     ramesh_df_count <- ramesh_df_count %>% 
+       dplyr::select(-gene)
+     ramesh_df_count <- as.data.frame(t(ramesh_df_count)) 
+     
+     ramesh_df_count$FBgn0019661 <- as.numeric(ramesh_df_count$FBgn0019661)
+     ramesh_df_count$FBgn0019660 <- as.numeric(ramesh_df_count$FBgn0019660)
+
+     ramesh_df_count$cell <- rownames(ramesh_df_count)     
+     
+ggplot(ramesh_df_count, aes(x = FBgn0019660)) +
+  geom_histogram(binwidth = 1)
+
+ggplot(ramesh_df_count, aes(x = FBgn0019661)) +
+  geom_histogram()
+
+Female_cells_df <- ramesh_df_count %>% 
+  filter(FBgn0019660 == 0 & FBgn0019661 == 0)
+Female_cells <- rownames(Female_cells_df)
+male_cells_df <- ramesh_df_count %>% 
+  filter(FBgn0019660 >= 1 | FBgn0019661 >= 3)
+male_cells <- rownames(male_cells_df)
+
+#sexed_cells <- as.data.frame(t(ramesh_counts))
+sexed_cells <- as.data.frame(t(ramesh_counts)) %>% 
+  mutate(cell = rownames(.))%>% 
+  mutate(sex = case_when(cell %in% Female_cells ~ "Female",
+                         cell %in% male_cells ~ "Male")) %>%
+ dplyr::select(sex, cell)
+rownames(sexed_cells) <- sexed_cells$cell
+
+cell_sex <- as.character(sexed_cells$sex)
+names(cell_sex) <- sexed_cells$cell
+
+ramesh$cell_sex <- cell_sex
+
+Idents(ramesh) <- ramesh$cell_sex
+ramesh_m_f <- subset(x = ramesh, idents = c("Male", "Female"))
+Idents(ramesh_m_f) <- "cell_sex"
+(sex_umap <- DimPlot(object = ramesh_m_f, reduction = "umap", pt.size = 1, cols = rev(colors_sex)))
+sex_table <- as.data.frame(table(Idents(ramesh_m_f)))
+#ggsave(sex_umap, filename = "results/sex_umap.png", height = 6, width = 8)
+
+Idents(ramesh) <- "seurat_clusters"
+DimPlot(object = ramesh, reduction = "umap", pt.size = 1)
+```
+
+## Subpopulation composition
+```{r}
+Idents(ramesh_m_f) <- ramesh_m_f$seurat_clusters
+ramesh_m_f$celltype_sex_treatment <- paste(Idents(ramesh_m_f), ramesh_m_f$cell_sex, ramesh_m_f$treatment, sep = "_")
+ramesh_m_f$celltype_sex <- paste(Idents(ramesh_m_f), ramesh_m_f$cell_sex, sep = "_")
+ramesh_m_f$celltype <- Idents(ramesh_m_f)
+ramesh_m_f$sex_treatment <- paste(ramesh_m_f$cell_sex, ramesh_m_f$treatment, sep = "_")
+ramesh_m_f$cell_treatment <- paste(ramesh_m_f$seurat_clusters, ramesh_m_f$treatment, sep = "_")
+ramesh_m_f$cell_sex_treatment_pop <- paste(ramesh_m_f$seurat_clusters, ramesh_m_f$cell_sex, ramesh_m_f$treatment, ramesh_m_f$population, sep = "_")
+ramesh_m_f$sex_treatment_pop <- paste(ramesh_m_f$treatment, ramesh_m_f$population, ramesh_m_f$cell_sex, sep = " ")
+ramesh_m_f$cell_treatment_pop <- paste(ramesh_m_f$seurat_clusters, ramesh_m_f$treatment, ramesh_m_f$population, sep = "_")
+
+Idents(ramesh_m_f) <- "seurat_clusters"
+
+celltypes <- ramesh_m_f$celltype
+celltypes <- unique(celltypes)
+
+cell_comp <- as.data.frame(table(ramesh_m_f$cell_sex_treatment_pop))
+cell_comp <- cell_comp %>% 
+  separate(Var1, into = c("celltype", "sex", "condition", "population"), sep = "_")
+
+cell_comp$Freq <- as.numeric(cell_comp$Freq)
+
+DimPlot(object = ramesh_m_f, reduction = "umap")
+metadata <- ramesh_m_f@meta.data %>% 
+  mutate(cell = rownames(ramesh_m_f@meta.data))
+
+```
+
+
+#### Subpop chisq
+```{r}
+metadata <- ramesh_m_f@meta.data %>% 
+  mutate(cell = rownames(ramesh_m_f@meta.data)) %>% 
+  mutate(gen_cell = (case_when(celltype == "AMP" ~ "Plasmatocyte",
+                                     celltype == "CC" ~ "Crystal_cell",
+                                     celltype == "LAM1" ~ "Lamellocyte",
+                                     celltype == "LAM2" ~ "Lamellocyte",
+                                     celltype == "LAM3" ~ "Lamellocyte",
+                                     celltype == "MET" ~ "Plasmatocyte", 
+                                     celltype == "PLASM1" ~ "Plasmatocyte",
+                                     celltype == "PLASM2" ~ "Plasmatocyte")))
+
+# glm_prep <- as.data.frame(table(metadata$gen_cell, metadata$cell_sex, metadata$population, metadata$treatment))
+# colnames(glm_prep) <- c("gen_cell", "cell_sex", "population", "treatment", "total_cell")
+# 
+# 
+# m1 <- glm(cbind(gen_cell, total_cell) ~ cell_sex * treatment * population, family = binomial, data = glm_prep)
+# m1.1 <- glm(cbind(gen_cell, total_cell) ~ cell_sex + treatment + population, family = binomial, data = glm_prep)
+# a1 <- anova(m1, m1.1)
+# 
+# tmp <- expand.grid(cell_sex = unique(glm_prep$cell_sex),
+#                    treatment = unique(glm_prep$treatment),
+#                    population = unique(glm_prep$population))
+# X <- model.matrix(~ cell_sex * treatment * population, data = tmp)
+# glht(m1, linfct = X)
+# Tukey <- contrMat(table(glm_prep$cell_sex), "Tukey")
+# K1 <- cbind(Tukey, matrix(0, nrow = nrow(Tukey), ncol = ncol(Tukey)))
+# rownames(K1) <- paste(levels(glm_prep$treatment)[1], rownames(K1), sep = ":")
+# K2 <- cbind(matrix(0, nrow = nrow(Tukey), ncol = ncol(Tukey)), Tukey)
+# rownames(K2) <- paste(levels(glm_prep$treatment)[2], rownames(K2), sep = ":")
+# K <- rbind(K1, K2)
+# colnames(K) <- c(colnames(Tukey), colnames(Tukey))
+# summary(glht(m1, linfct = K %*% X))
+# 
+# k1 <- glht(m1, mcp(cell_sex = "Tukey"))$linfct
+# multcomp = glht(model_Group, linfct=mcp(Group="Tukey"))
+# Comp = cld(multcomp)
+# 
+# unlist(Comp$mcletters$Letters)%>%
+#   kable(col.names = "Sign.group") %>%
+#   kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+# 
+# #Make some data
+# sex=rep(c("male","Female"), times=c(12,26))
+# 
+# #Produce a table
+# table(sex)
+# 
+#  #Run the test,
+# chisq.test(table(sex)) #almost significant, not quite
+# 
+# 
+# total_plasm1 <- metadata %>% 
+#   filter(treatment == "No Infection" & population == "No Selection") %>% 
+#   summarise(total = n())
+# 
+# plasm1_sex <- metadata %>% 
+#   filter(seurat_clusters == "PLASM1" & treatment == "No Infection" & population == "No Selection") %>% 
+#   select(cell_sex) %>% 
+#   group_by(cell_sex) %>% 
+#   summarise(cells = n()) %>% 
+#   cbind(total_plasm1) %>% 
+#   mutate(prop = cells/total) %>% 
+#   select(cell_sex, prop) 
+# table_plasm1 <- table(plasm1_sex)
+# table_prop_plasm1 <- as.table(plasm1_sex)
+# 
+# chisq.test(table(plasm1_sex))
+# #Chi-squared test for given probabilities
+# 
+# #data:  table(plasm1_sex)
+# #X-squared = 139.04, df = 1, p-value < 2.2e-16
+
+subpop_chi <- vector("list")
+for (i in celltypes) {
+  sex <- metadata %>% 
+  filter(seurat_clusters == i & treatment == "No Infection" & population == "No Selection") %>% 
+  dplyr::select(cell_sex)
+
+subpop_chi[[i]] <- chisq.test(table(sex))
+}
+
+cell_comp <- as.data.frame(table(ramesh_m_f$cell_sex_treatment_pop)) %>% 
+  separate(Var1, into = c("celltype", "sex", "condition", "population"), sep = "_") %>% 
+  #filter(condition == "No Infection" & population == "No Selection") %>% 
+  group_by(sex, population, condition) %>% 
+  mutate(total = sum(Freq)) %>% 
+  ungroup() %>% 
+  mutate(percent = (Freq/total)*100)
+
+  cc_ni_f <- cell_comp %>% 
+  filter(celltype == "CC" & condition == "No Infection", sex == "Female") %>% 
+  select(population, Freq, total)
+freq <- pull(cc_ni, Freq)
+total <- pull(cc_ni, total)
+  
+test <- prop.test(x = freq, n = total)
+
+#where x is your vector of successes and n is the total trials, or total cells or whatever
+celltypes <- unique(cell_comp$celltype)
+conditions <- unique(cell_comp$condition)
+sexes <- unique(cell_comp$sex)
+
+  subpop_prop <- list()
+comp <- vector("list")
+test <- vector("list")
+for(i in celltypes){
+  for(j in conditions){
+    for(k in sexes){
+      comp <- cell_comp %>% 
+        filter(celltype == i) %>% 
+        filter(condition == j) %>% 
+        filter(sex == k) %>% 
+        select(sex, Freq, total)
+test[[i]][[j]][[k]] <- prop.test(x = comp$Freq, n = comp$total)
+    }
+  }
+}
+
+p_val_inf_f <- sapply(1:length(test), function(i) as.numeric(test[[i]][[1]][[1]][[3]]))
+p_val_noinf_f <- sapply(1:length(test), function(i) as.numeric(test[[i]][[2]][[1]][[3]]))
+p_val_inf_m <- sapply(1:length(test), function(i) as.numeric(test[[i]][[1]][[2]][[3]]))
+p_val_noinf_m <- sapply(1:length(test), function(i) as.numeric(test[[i]][[2]][[2]][[3]]))
+
+signif <- data.frame(Group = names(test),
+                     p_val_inf_f = p_val_inf_f,
+                     p_val_noinf_f,
+                     p_val_inf_m,
+                     p_val_noinf_m) %>% 
+  pivot_longer(cols = 2:5, names_to = "subset", values_to = "p_val") %>% 
+  separate(subset, into = c("p", "val", "condition", "sex")) %>% 
+  select(-p, -val) %>% 
+  mutate(condition = case_when(condition == "inf" ~ "Infection",
+                               TRUE ~ "No Infection"),
+         sex = case_when(sex == "f" ~ "Female",
+                         TRUE ~ "Male"),
+         pval_round = round(p_val, 3),
+         label = paste(sex, "P. value =", pval_round, sep = " ")) %>% 
+  rename(celltype = Group)
+```
+
+
+#### Gen umap
+```{r}
+colors <- c("lightgrey", "#440154FF", "#2C728EFF", "#5DC863FF")
+names(colors) <- c("grey", "Plasmatocyte", "Crystal_cell", "Lamellocyte")
+cells_char <- c("Plasmatocyte", "Crystal_cell", "Lamellocyte")
+
+umap_loop <- vector("list")
+sex_treatment_pop <- unique(ramesh_m_f$sex_treatment_pop)
+output <- "results/cell_comp/"
+
+for(i in sex_treatment_pop) {
+umap <- as.data.frame(ramesh_m_f@reductions$umap@cell.embeddings) %>% 
+  mutate(cell = rownames(ramesh_m_f@reductions$umap@cell.embeddings)) %>% 
+  left_join(metadata)%>% 
+  mutate(gen_cell = (case_when(celltype == "AMP" ~ "Plasmatocyte",
+                                     celltype == "CC" ~ "Crystal_cell",
+                                     celltype == "LAM1" ~ "Lamellocyte",
+                                     celltype == "LAM2" ~ "Lamellocyte",
+                                     celltype == "LAM3" ~ "Lamellocyte",
+                                     celltype == "MET" ~ "Plasmatocyte", 
+                                     celltype == "PLASM1" ~ "Plasmatocyte",
+                                     celltype == "PLASM2" ~ "Plasmatocyte"))) %>% 
+  mutate(Subpopulation = gen_cell) %>% 
+  mutate(Subpopulation = case_when(sex_treatment_pop != i ~ "grey", TRUE ~ "NA"))
+umap$Subpopulation <- ifelse(umap$Subpopulation == "NA", as.character(umap$gen_cell), umap$Subpopulation)
+
+umap_loop[[i]] <- ggplot(umap, aes(x = UMAP_1, y = UMAP_2)) +
+  geom_point(data = umap[umap$Subpopulation == "grey",], aes(UMAP_1, UMAP_2, color = Subpopulation), alpha = 0.85) +
+  geom_point(data = umap[umap$Subpopulation != "grey",], aes(UMAP_1, UMAP_2, color = Subpopulation)) +
+  scale_color_manual(values = colors, breaks = cells_char) +
+  theme_classic() +
+  guides(color=guide_legend(title="Cell Type")) +
+  ggtitle(paste(i))
+ggsave(umap_loop[[i]], filename = paste0(output,i,"_gen_umap.png"), width = 15, height = 9, units = "in", dpi = 300)
+}
+
+
+#legend <- cowplot::get_legend(umap_loop$`No Infection No Selection Male`)
+
+# 
+# (all_umap <- grid.arrange(umap_loop$`No Infection No Selection Female` + theme(legend.position = "none"), umap_loop$`Infection No Selection Female` + theme(legend.position = "none"), umap_loop$`No Infection No Selection Male` + theme(legend.position = "none"), umap_loop$`Infection No Selection Male` + theme(legend.position = "none"), umap_loop$`No Infection Selection Female` + theme(legend.position = "none"), umap_loop$`Infection Selection Female` + theme(legend.position = "none"), umap_loop$`No Infection Selection Male` + theme(legend.position = "none"), umap_loop$`Infection Selection Male` + theme(legend.position = "none"), legend, widths = c(5,5,2), layout_matrix = rbind(c(1,2,9),
+#                                                     c(3,4,9),
+#                                                     c(5,6,9),
+#                                                     c(7,8,9))))
+#ggsave(all_umap, filename = paste0(output,"all","_gen_umap.png"), width = 12, height = 14.4, units = "in", dpi = 300)
+```
+
+
+### Cell comp interaction
+```{r}
+colors_pop <- c("#9F2F7F", "#FEC98D")
+
+
+
+cell_comp <- as.data.frame(table(ramesh_m_f$cell_sex_treatment_pop)) %>% 
+  separate(Var1, into = c("celltype", "sex", "condition", "population"), sep = "_") %>% 
+  mutate(gen_cell = (case_when(celltype == "AMP" ~ "Plasmatocyte",
+                                     celltype == "CC" ~ "Crystal_cell",
+                                     celltype == "LAM1" ~ "Lamellocyte",
+                                     celltype == "LAM2" ~ "Lamellocyte",
+                                     celltype == "LAM3" ~ "Lamellocyte",
+                                     celltype == "MET" ~ "Plasmatocyte", 
+                                     celltype == "PLASM1" ~ "Plasmatocyte",
+                                     celltype == "PLASM2" ~ "Plasmatocyte"))) %>% 
+  group_by(sex, condition, population) %>% 
+  mutate(total = sum(Freq)) %>% 
+  ungroup() %>% 
+  group_by(celltype, sex, condition, population) %>% 
+  mutate(num_cells = sum(Freq)) %>% 
+  ungroup() %>% 
+  mutate(percent = (Freq/total)*100) %>% 
+  mutate(gen_perc = (num_cells/total)*100) %>% 
+  mutate(sex_cond = paste(sex, condition, sep = " "))  %>% 
+  mutate(sex_cond = fct_relevel(sex_cond, 
+                            "Female No Infection", "Male No Infection", "Female Infection", "Male Infection")) %>% 
+  mutate(sex_pop = paste(sex, population, sep = " ")) %>% 
+  mutate(condition = fct_relevel(condition, "No Infection", "Infection")) %>% 
+  mutate(pop_cond = paste(population, condition, sep = " ")) %>% 
+  mutate(pop_cond = fct_relevel(pop_cond, "No Selection No Infection", "No Selection Infection","Selection No Infection",  "Selection Infection")) %>% 
+  mutate(celltype = fct_relevel(as.factor(celltype), "CC", "LAM1", "LAM2", "LAM3", "PLASM1", "PLASM2", "AMP", "MET")) %>% 
+  arrange(sex, condition, population) %>% 
+  left_join(signif)
+
+cell.labs <- c("Crystal cells", "Lamellocytes", "Plasmatocytes")
+names(cell.labs) <- c("Crystal_cell", "Lamellocyte", "Plasmatocyte")
+sex.labs <- c("Female", "Male")
+names(sex.labs) <- c("Female", "Male")
+pop.labs <- c("Non-evolved", "Evolved")
+names(pop.labs) <- c("No Selection", "Selection")
+
+
+(cell_inter <- ggplot(cell_comp, aes(x = condition, y = gen_perc, group = population)) +
+  geom_line(aes(color = population), linewidth = 2) +
+  facet_grid(celltype~sex, labeller = labeller(sex = sex.labs), scales = "free") +
+  theme_bw() +
+    theme(strip.background = element_rect(fill = "white")) +
+   labs(fill = "") +
+         ylab("Percentage of female or male cells in subpopulation") +
+  scale_color_manual(values = colors_pop) +
+    guides(color=guide_legend(title="Population")) +
+    xlab("")) 
+
+ggsave(cell_inter, filename = paste0(output,"cell_inter.png"), width = 6, height = 8, units = "in", dpi = 300)
+
+
+(cell_by_sex <- ggplot(cell_comp, aes(x = condition, y = percent, group = sex)) +
+  geom_line(aes(color = sex), linewidth = 2) +
+  facet_grid(celltype~population, labeller = labeller(population = pop.labs), scales = "free") +
+  theme_bw() +
+   labs(fill = "") +
+         ylab("Percentage of Female or male cells in subpopulation") +
+  scale_color_manual(values = colors_sex) +
+  #  ylim(c(0, 100)) +
+  labs(color = "Sex") +
+  xlab(""))
+ggsave(cell_by_sex, filename = paste0(output,"cell_by_sex.png"), width = 6, height = 7, units = "in", dpi = 300)  
+
+(cell_by_inf <- ggplot(cell_comp, aes(x = population, y = percent, group = sex)) +
+  geom_line(aes(color = sex), size = 2) +
+  geom_text(data = (cell_comp %>% distinct(celltype, sex, condition, .keep_all = TRUE)), aes(label = label, x = 1.5, y = (percent*2))) +
+  facet_grid(celltype~condition, scales = "free") +
+  theme_bw() +
+    theme(strip.background = element_rect(fill = "white")) +
+   labs(fill = "") +
+         ylab("Percentage of female or male cells in subpopulation") +
+  scale_color_manual(values = colors_sex) +
+  #  ylim(c(0, 100)) +
+  labs(color = "Sex") +
+  xlab(""))
+ggsave(cell_by_inf, filename = paste0(output,"cell_by_inf.png"), width = 6, height = 7, units = "in", dpi = 300)  
+
+
+gen_cell_comp <- as.data.frame(table(ramesh_m_f$cell_sex_treatment_pop)) %>% 
+  separate(Var1, into = c("celltype", "sex", "condition", "population"), sep = "_") %>% 
+  mutate(gen_cell = (case_when(celltype == "AMP" ~ "Plasmatocyte",
+                                     celltype == "CC" ~ "Crystal_cell",
+                                     celltype == "LAM1" ~ "Lamellocyte",
+                                     celltype == "LAM2" ~ "Lamellocyte",
+                                     celltype == "LAM3" ~ "Lamellocyte",
+                                     celltype == "MET" ~ "Plasmatocyte", 
+                                     celltype == "PLASM1" ~ "Plasmatocyte",
+                                     celltype == "PLASM2" ~ "Plasmatocyte"))) %>% 
+  group_by(gen_cell, sex, condition, population) %>% 
+  mutate(total_gen_cells = sum(Freq)) %>% 
+  ungroup() %>% 
+  select(-celltype, -Freq) %>% 
+  group_by(sex, condition, population) %>% 
+  mutate(total_cells = sum(total_gen_cells)) %>% 
+  ungroup() %>% 
+  mutate(percent = (total_gen_cells/total_cells)*100) %>% 
+  mutate(condition = fct_relevel(condition, "No Infection", "Infection")) %>% 
+  arrange(sex, condition, population)
+
+cell.labs <- c("Crystal cells", "Lamellocytes", "Plasmatocytes")
+names(cell.labs) <- c("Crystal_cell", "Lamellocyte", "Plasmatocyte")
+
+
+(gen_cell_by_inf <- ggplot(gen_cell_comp, aes(x = population, y = percent, group = sex)) +
+  geom_line(aes(color = sex), size = 2) +
+  facet_grid(gen_cell~condition, scales = "free", labeller = labeller(gen_cell = cell.labs)) +
+  theme_bw() +
+    theme(strip.background = element_rect(fill = "white")) +
+   labs(fill = "") +
+         ylab("Percentage of female or male cells in subpopulation") +
+  scale_color_manual(values = colors_sex) +
+  #  ylim(c(0, 100)) +
+  labs(color = "Sex") +
+  xlab(""))
+ggsave(gen_cell_by_inf, filename = paste0(output,"gen_cell_by_inf.png"), width = 5, height = 4, units = "in", dpi = 300)  
+```
+
