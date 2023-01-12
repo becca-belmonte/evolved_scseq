@@ -468,3 +468,191 @@ names(cell.labs) <- c("Crystal_cell", "Lamellocyte", "Plasmatocyte")
 ggsave(gen_cell_by_inf, filename = paste0(output,"gen_cell_by_inf.png"), width = 5, height = 4, units = "in", dpi = 300)  
 ```
 
+
+# Larval bulk-seq 
+## Libraries
+
+```{r}
+library(tidyverse)
+library(DESeq2)
+library(kableExtra)
+library(heatmap3)
+library(viridis)
+library(ggrepel)
+
+library(heatmaply)
+library(hrbrthemes)
+library(plotly)
+library(d3heatmap)
+
+colors_sex <- c("#D3C164", "#05366E")
+colors_inf <- c("#000004", "#FEC98D")
+text_sex <- c("Female", "Male")
+text_inf <- c("Infected", "Uninfected")
+
+```
+
+
+```{r}
+fpkm_counts <- read.csv("data/fpkm_gene.csv")
+rownames(fpkm_counts) <- fpkm_counts$gene_name
+fpkm_counts <- fpkm_counts %>% 
+  select(-c(X, gene_id, source, gene_name, gene_biotype, phase))
+
+full_counts <- read.csv("data/raw_gene.csv")
+rownames(full_counts) <- full_counts$gene_name
+counts <- full_counts %>% 
+  select(-c(X, gene_id, source, gene_name, gene_biotype, phase))
+
+col_data <- read.csv("data/col_data_for_r.csv")
+rownames(col_data) <- col_data$ID
+```
+
+## Analysis
+
+```{r}
+count_data_larv <- counts %>% 
+  select(contains("lar"))
+
+col_data_larv <- col_data %>% 
+  filter(Stage == "larvae")
+
+rownames(col_data_larv) %in% colnames(count_data_larv)
+
+matrix_count_data_larv <- as.matrix(count_data_larv)
+
+dds_larv <- DESeqDataSetFromMatrix(countData = matrix_count_data_larv, 
+                                   colData = col_data_larv,
+                                   design = ~ Sex)
+
+dds_larv <- estimateSizeFactors(dds_larv)
+ddsTC_larv <- DESeq(dds_larv, test = "LRT", reduced = ~ 1)
+resTC_larv <- results(ddsTC_larv)
+
+resTC_larv$gene <- rownames(resTC_larv)
+tab_resTC_larv <- as.data.frame(resTC_larv)
+
+tab_top_larv <- tab_resTC_larv %>% 
+  filter(baseMean >= 10 & abs(log2FoldChange) >= 2 & padj < 0.01) %>% 
+  arrange(padj)
+kable(head(tab_top_larv, 10)) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  scroll_box(width = "100%")
+
+#write.csv(tab_top_larv, file = "Results/tab_top_larv.csv")
+```
+
+## Visualisations
+### Raw counts
+```{r}
+best12_larv <- head(tab_top_larv,12)
+best12_larv_genes <- best12_larv$gene
+
+col_data_larv <- col_data_larv %>% 
+  arrange(ID)
+
+
+fpkm_larv <- fpkm_counts %>% 
+  mutate(gene = rownames(fpkm_counts)) %>% 
+  filter(gene %in% best12_larv_genes) %>% 
+  select(contains("lar"))
+fpkm_larv <- as.data.frame(t(fpkm_larv))
+fpkm_larv <- fpkm_larv %>% 
+  mutate(group = rownames(fpkm_larv)) %>% 
+  arrange(group) %>% 
+  cbind(col_data_larv) %>% 
+  pivot_longer(best12_larv_genes, names_to = "gene", values_to = "counts")
+fpkm_larv$Rep <- as.factor(fpkm_larv$Rep)
+
+(larv_rawcounts <- ggplot(fpkm_larv, aes(x = Sex, y = counts)) +
+  geom_point(aes(color = Rep)) +
+  scale_color_viridis_d() +
+  facet_wrap(~gene, scale = "free_y") +
+  theme_classic() +
+  xlab("Sex") +
+  ylab("Normalized counts (fpkm)") +
+  ggtitle("Sex dimorphic genes in unchallenged larval hemocytes"))
+#ggsave("Results/larv_raw.png", plot = larv_rawcounts, width = 240, height = 150, units = "mm") 
+```
+
+### Heatmap
+```{r}
+rldTC_larv <- rlog(ddsTC_larv)
+colors <- colorRampPalette( viridis(9) )(28236)
+sidecols <- colors_sex[ rldTC_larv$Sex ]
+leg_fill <- c(colors_sex)
+top_larv <- tab_top_larv$gene
+
+mat_larv <- assay(rldTC_larv)[top_larv, ]
+
+mat_larv <- mat_larv - rowMeans(mat_larv)
+
+heatmap3(mat_larv, trace = "none", col = colors, ColSideColors = sidecols, ColSideColorsSize = 2, RowSideColorsSize = 1, labCol = NULL, labRow = rownames(mat_larv), RowSideLabs = F, ColSideLabs = F, mar = c(5, 12), key.title = "Expression", cexRow = 1, scale = "row")
+legend("topright", legend = c("Female", "Male"), fill = leg_fill, border = FALSE, bty = "n", y.intersp = 0.9, cex = 0.9)
+
+
+(heat_larv <- heatmaply(mat_larv, xlab = "", ylab = "", main = "", scale = "column",
+          margins = c(60,100,40,20), 
+          grid_width = 0.00001, titleX = FALSE,
+          hide_colorbar = TRUE, branches_lwd = 0.1, 
+          label_names = c("Gene", "Sample", "Value"),
+          fontsize_row = 10, fontsize_col = 10,
+          labCol = colnames(mat_larv),
+          labRow = rownames(mat_larv),
+          heatmap_layers = theme(axis.line = element_blank())))
+```
+
+
+
+### Volcano plot
+```{r}
+colors_vol <- c(rev(colors_sex), "darkgrey")
+vol_resTC_larv <- tab_resTC_larv %>% 
+  mutate(color = factor(case_when(log2FoldChange >= 2 & padj < 0.05 ~ "blue", 
+                                  log2FoldChange <= -2 & padj < 0.05 ~ "red", 
+                                  log2FoldChange %in% c(-2:2) ~ "grey"))) %>% 
+  mutate(significance = case_when(log2FoldChange >= 2 ~ "yes", log2FoldChange <= -2 ~ "yes")) 
+
+significant <- subset(vol_resTC_larv, significance=="yes")
+sig_genes <- significant$gene
+
+vol_resTC_larv$color <- as.character(vol_resTC_larv$color)
+vol_resTC_larv$color <- replace_na(vol_resTC_larv$color,"black")
+
+(larv_vol <- ggplot(vol_resTC_larv, aes(x = log2FoldChange, y = -log10(pvalue), label = gene)) +
+  geom_point(aes(color = color), alpha = 0.5)+
+  geom_text_repel(data = vol_resTC_larv %>% filter(log2FoldChange < -2 & pvalue < 0.001 | log2FoldChange > 2.5 & pvalue <10^-5), aes(label = gene)) +
+  geom_vline(xintercept=2,color="darkgrey", linetype = "dotted")+
+  geom_vline(xintercept=-2,color="darkgrey", linetype = "dotted")+
+  geom_hline(yintercept=-log10(0.05),color="darkgrey",linetype="dashed") +
+  theme_bw() +
+  scale_colour_manual(limits=c("blue","red", "black"),
+                      values = colors_vol,
+                      labels=c("Upregulated in males","Upregulated in females","ns")) +
+  labs(color = "Sex bias") +
+  ggtitle("Differential expression in male and female unchallenged larval hemocytes"))
+ggsave(larv_vol, filename = paste0("figures/larv_vol.png"), width = 6.7, height = 4, units = "in", dpi = 300)
+
+vol_resTC_larv <- vol_resTC_larv %>% 
+  filter(gene != "roX1")
+significant <- subset(vol_resTC_larv, significance=="yes")
+sig_genes <- significant$gene
+
+tab_resTC_larv$color <- as.character(vol_resTC_larv$color)
+tab_resTC_larv$color <- replace_na(vol_resTC_larv$color,"black")
+
+(larv_vol_no_rox <- ggplot(vol_resTC_larv, aes(x = log2FoldChange, y = -log10(pvalue), label = gene)) +
+  geom_point(aes(color = color), alpha = 0.5)+
+  geom_text_repel(data = vol_resTC_larv %>% filter(log2FoldChange < -2 & pvalue < 0.001 | log2FoldChange > 2.5 & pvalue <10^-5), aes(label = gene)) +
+  geom_vline(xintercept=2,color="darkgrey", linetype = "dotted")+
+  geom_vline(xintercept=-2,color="darkgrey", linetype = "dotted")+
+  geom_hline(yintercept=-log10(0.05),color="darkgrey",linetype="dashed") +
+  theme_bw() +
+  scale_colour_manual(limits=c("blue","red", "black"),
+                      values = colors_vol,
+                      labels=c("Upregulated in males","Upregulated in females","ns")) +
+  labs(color = "Sex bias") +
+  ggtitle("Differential expression in male and female unchallenged larval hemocytes (excluding roX1)"))
+#ggsave(larv_vol_no_rox, filename = paste0("figures/larv_vol_no_rox.png"), width = 6.7, height = 4, units = "in", dpi = 300)
+```
+
